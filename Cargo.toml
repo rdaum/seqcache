@@ -1,0 +1,33 @@
+[package]
+name = "seqcache"
+version = "0.1.0"
+authors = ["Ryan Daum <ryan.daum@gmail.com>"]
+categories = ["caching", "data-structures", "memory-management"]
+documentation = "https://docs.rs/seqcache"
+edition = "2024"
+homepage = "https://github.com/rdaum/seqcache"
+keywords = ["inference", "kv-cache", "llm", "prefix-cache", "paged-attention"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/rdaum/seqcache"
+rust-version = "1.95"
+description = "Reusable page management for KV caches and other autoregressive inference state"
+
+[features]
+default = []
+cuda-example = []
+
+[dependencies]
+fast-telemetry = "0.8"
+rart = "0.11"
+
+[dev-dependencies]
+micromeasure = "0.15"
+
+[[bench]]
+name = "seqcache"
+harness = false
+
+[[example]]
+name = "cuda_paged_state"
+required-features = ["cuda-example"]

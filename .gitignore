@@ -1,0 +1,25 @@
+# Cargo build output
+/target/
+**/*.rs.bk
+
+# This repository is a library; downstream applications own dependency locks.
+/Cargo.lock
+
+# Profiling and coverage output
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local editor and operating-system files
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/

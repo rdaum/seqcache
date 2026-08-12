@@ -1,15 +1,18 @@
 # seqcache
 
-`seqcache` is a backend-independent manager for paged inference state. It tracks which physical
-pages belong to each live sequence, shares cached prompt prefixes between requests, reserves memory
-before accepting work, and makes writes across page boundaries transactional. The application
-supplies the actual CPU or accelerator storage.
+`seqcache` is a backend-independent manager for paged inference state. For transformer attention,
+that state usually consists of the Key and Value tensors produced by every attention layer. In this
+context, "Key" and "Value" are the names of those tensors: a KV cache is not an associative
+key-to-value cache.
 
-When a model processes a prompt, it produces internal state needed by every later token. For a
-transformer this is usually the attention key/value cache. Keeping that state for a repeated prompt
-can avoid most of the next request's prefill, but the state is large, mutable, and normally split
-into fixed-width physical pages. Reusing it safely requires more than a map from tokens to buffers.
-An inference runtime must also answer:
+The crate does not define or store the tensor contents itself. It tracks which backend-owned
+physical pages belong to each live sequence, shares cached prompt prefixes between requests,
+reserves memory before accepting work, and makes writes across page boundaries transactional. The
+application supplies the actual CPU or accelerator storage through a `PageBackend` implementation.
+
+Keeping attention state for a repeated prompt can avoid most of the next request's prefill, but the
+state is large, mutable, and normally split into fixed-width physical pages. Reusing it safely
+requires more than storing tensor rows for token positions. An inference runtime must also answer:
 
 - Which physical pages are owned by a live sequence?
 - When is a page immutable and safe to share?
@@ -19,13 +22,12 @@ An inference runtime must also answer:
 - Which retained prefix should be evicted under pressure?
 - How can a request branch from a shared prefix without copying all prior state?
 
-This crate provides that ownership, transaction, indexing, and accounting machinery. The embedding
-runtime provides the actual storage through a `PageBackend` implementation.
+This crate provides that ownership, transaction, indexing, and accounting machinery.
 
-It was designed for transformer KV caches, but it deliberately does not know what a key or value
-tensor is. A page may bundle KV tensors from many layers, compressed attention state, or another
-form of position-indexed model state. Non-paged state such as recurrent tensors can be retained
-alongside a prefix in a runtime-defined snapshot.
+It was designed for transformer KV caches, but it deliberately does not define the layout or
+contents of their Key and Value tensors. A page may bundle attention tensors from many layers,
+compressed attention state, or another form of position-indexed model state. Non-paged state such as
+recurrent tensors can be retained alongside a prefix in a runtime-defined snapshot.
 
 ## Why use it?
 
@@ -143,10 +145,10 @@ Implement `PageBackend` for the runtime's storage, choose a `RetainedSnapshot` t
 non-paged state, and construct `SequenceCache<Backend, Snapshot>`. Use `()` when there is no
 additional retained state.
 
-### Paged CPU KV-cache example
+### Paged CPU attention-KV example
 
 [`examples/cpu_paged_kv.rs`](examples/cpu_paged_kv.rs) implements a complete in-memory CPU backend.
-Each physical page owns token-major key and value matrices for every attention layer, following the
+Each physical page owns token-major Key and Value matrices for every attention layer, following the
 simple storage shape used by CPU inference engines such as
 [tinfer](https://github.com/rdaum/tinfer). The example demonstrates:
 
@@ -164,7 +166,7 @@ Run it with:
 cargo run --example cpu_paged_kv
 ```
 
-The generated floating-point rows stand in for a model's key and value projection output. The
+The generated floating-point rows stand in for a model's Key and Value projection output. The
 ownership, transaction, page-table, recycling, and read paths are real. Cache accounting covers the
 managed KV payload; ordinary Rust collection and allocator metadata remains process overhead.
 

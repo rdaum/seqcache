@@ -149,8 +149,7 @@ additional retained state.
 
 [`examples/cpu_paged_kv.rs`](examples/cpu_paged_kv.rs) implements a complete in-memory CPU backend.
 Each physical page owns token-major Key and Value matrices for every attention layer, following the
-simple storage shape used by CPU inference engines such as
-[tinfer](https://github.com/rdaum/tinfer). The example demonstrates:
+simple storage shape used by CPU inference engines. The example demonstrates:
 
 - backend-owned physical storage behind compact page handles;
 - a model-sized write scattered directly across several cache pages;
@@ -551,8 +550,11 @@ reservation first.
 
 ## Metrics and inspection
 
-`CacheMetrics` exports `fast-telemetry` counters, histograms, and gauges under the `seqcache`
-prefix.
+`CacheMetrics` exposes counters, histograms, and gauges under the `seqcache` prefix using
+[`fast-telemetry`](https://github.com/eden-dev-inc/fast-telemetry/). The embedding runtime can
+connect this metric set to `fast-telemetry` exporters for Prometheus, DogStatsD-compatible services
+such as Datadog, OTLP, ClickHouse, or a custom in-process visitor. `seqcache` records the metrics;
+the runtime chooses and operates the export pipeline.
 
 Counters cover prefix hits and misses, restored tokens, admissions, prefix evictions, page
 allocation and recycling, sealing, copy-on-write, retirement, and backend failures. Histograms cover
@@ -594,8 +596,8 @@ compute-capable adapter exposed through Vulkan, Metal, DirectX 12, or OpenGL ES.
 
 ## Benchmarks
 
-The micromeasure suite isolates manager, index, page-table, and accounting overhead with a
-storage-free backend:
+The [micromeasure](https://github.com/rdaum/micromeasure) suite isolates manager, index, page-table,
+and accounting overhead with a storage-free backend:
 
 ```sh
 cargo bench --bench seqcache

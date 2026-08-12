@@ -92,7 +92,7 @@ request scheduler / model runtime
               ▼
        physical runtime storage
        ├── CPU buffers
-       ├── CUDA page slabs
+       ├── CUDA or wgpu page slabs
        └── model-specific state pages
 ```
 
@@ -188,6 +188,27 @@ cargo run --features cuda-example --example cuda_paged_state
 For clarity, commit and retirement synchronize the stream before shortening a page table or
 recycling storage. A production backend can replace those host waits with event-based deferred
 retirement while preserving the same ownership contract.
+
+### Native wgpu paged-state example
+
+[`examples/wgpu_paged_state.rs`](examples/wgpu_paged_state.rs) implements a native accelerator
+backend over `wgpu`. It preallocates one storage-buffer slab, represents physical pages with compact
+slot indices, and publishes a device-resident logical page table consumed by a WGSL compute shader.
+One dispatch writes across three physical pages, and an unaligned branch exercises GPU copy-on-write
+for the private tail.
+
+The example selects a native Vulkan, Metal, DirectX 12, or OpenGL ES adapter. Browser WebGPU is
+intentionally unsupported because the conservative reclamation path uses blocking device polling; an
+asynchronous browser runtime would instead integrate completion callbacks with its event loop. Run
+it with:
+
+```sh
+cargo run --features wgpu-example --example wgpu_paged_state
+```
+
+Like the CUDA example, this backend waits before shortening a published table or recycling a page.
+It uses a readback buffer only to validate the result; model output is written directly into the
+paged storage slab.
 
 ## Core model
 
@@ -567,8 +588,9 @@ An external backend should reuse the same scenarios against its physical storage
 implementation. Passing the manager's in-memory tests does not prove that a device backend obeys
 ordering or rollback rules.
 
-The feature-gated CUDA example is type-checked by Clippy, but executing it requires a CUDA-capable
-Linux host and NVIDIA driver.
+The feature-gated CUDA and wgpu examples are type-checked by Clippy. Executing the CUDA example
+requires a CUDA-capable Linux host and NVIDIA driver; executing the wgpu example requires a native
+compute-capable adapter exposed through Vulkan, Metal, DirectX 12, or OpenGL ES.
 
 ## Benchmarks
 

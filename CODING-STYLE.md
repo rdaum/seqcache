@@ -147,11 +147,13 @@ cargo package
 ```
 
 Run the CPU example when changing the backend contract. Run the CUDA example on a CUDA-capable Linux
-host when changing accelerator-facing behaviour:
+host when changing CUDA-facing behaviour, and run the native wgpu example on a host with a supported
+compute adapter when changing its backend:
 
 ```bash
 cargo run --example cpu_paged_kv
 cargo run --features cuda-example --example cuda_paged_state
+cargo run --features wgpu-example --example wgpu_paged_state
 ```
 
 State exactly what was and was not run when environmental requirements prevent full validation.

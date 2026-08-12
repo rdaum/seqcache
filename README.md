@@ -552,7 +552,7 @@ Repository conventions and API-specific engineering guidance are documented in
 dprint check
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo test --all-features --lib --tests
 cargo package
 ```
 

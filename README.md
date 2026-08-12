@@ -562,7 +562,8 @@ lookup, insertion, eviction, admission, and snapshot-restore latency.
 
 Gauges mirror `CacheStats`, including active sequences, resident and reserved pages, deferred
 retirements, snapshot bytes, page-table bytes, reclaimable prefix-only bytes, and total managed
-bytes.
+bytes. These exact totals are maintained incrementally with ownership mutations rather than by
+scanning the live cache.
 
 `SequenceCache::validate()` recomputes ownership, reference counts, page validity, alignment,
 accounting, and metric gauges from first principles. It is intended for tests and health checks

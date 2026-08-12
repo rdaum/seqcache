@@ -882,6 +882,25 @@ fn duplicate_insertion_does_not_evict_another_prefix() {
 }
 
 #[test]
+fn entry_pressure_evicts_the_least_recently_used_prefix() {
+    let mut cfg = config(10_000);
+    cfg.max_prefix_entries = Some(2);
+    let mut cache = SequenceCache::new(cfg, FakeBackend::new(100)).expect("cache");
+    let mut context = FakeContext::default();
+    let (first, _) = make_retained_prefix(&mut cache, &[1, 2, 3, 4], 4, 0, &mut context);
+    let (_second, _) = make_retained_prefix(&mut cache, &[5, 6, 7, 8], 4, 0, &mut context);
+
+    assert!(cache.lookup_prefix(&[1, 2, 3, 4, 9]).is_some());
+    let (_third, _) = make_retained_prefix(&mut cache, &[9, 10, 11, 12], 4, 0, &mut context);
+
+    assert!(cache.contains_prefix(&[1, 2, 3, 4], 4));
+    assert!(!cache.contains_prefix(&[5, 6, 7, 8], 4));
+    assert!(cache.contains_prefix(&[9, 10, 11, 12], 4));
+    cache.finish(first, &mut context).expect("finish first");
+    cache.validate().expect("valid indexed LRU state");
+}
+
+#[test]
 fn insertion_and_aligned_restore_share_pages_without_copy_or_allocation() {
     let mut cache = cache(2_000);
     let mut context = FakeContext::default();

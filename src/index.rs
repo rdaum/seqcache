@@ -13,8 +13,9 @@
 
 use crate::error::{CacheError, Result};
 use crate::manager::{PrefixEntryId, TokenBlockId};
+use foldhash::{HashMap, HashMapExt};
 use rart::{AdaptiveRadixTree, OverflowKey};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 /// ART key type: block IDs inline up to 32 bytes, overflowing to the heap.
 pub(crate) type PrefixKey = OverflowKey<32, 8>;

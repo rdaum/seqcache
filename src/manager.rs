@@ -10,7 +10,7 @@ use crate::error::{CacheError, ConfigError, Result};
 use crate::index::{PrefixIndex, PrefixKey};
 use crate::metrics::CacheMetrics;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::time::Instant;
 
@@ -354,9 +354,9 @@ impl PageTableView<'_> {
 
 /// Exact synchronous state owned by one manager.
 ///
-/// Recomputed from ownership records after every mutation
-/// ([`SequenceCache::stats`]) and mirrored to the exported gauges, so optimizing
-/// telemetry against ownership is checked by [`SequenceCache::validate`].
+/// Maintained incrementally with ownership mutations and mirrored to the
+/// exported gauges. [`SequenceCache::validate`] independently recomputes every
+/// field from ownership records to check the optimized accounting path.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CacheStats {
     /// Live sequences admitted but not yet finished.
@@ -483,6 +483,7 @@ pub struct SequenceCache<B: PageBackend, S: RetainedSnapshot> {
     sequences: Vec<Slot<SequenceRecord<B::AppendTransaction>>>,
     free_sequence_slots: Vec<usize>,
     prefixes: BTreeMap<PrefixEntryId, PrefixEntry<S>>,
+    lru: BTreeSet<(u64, PrefixEntryId)>,
     next_prefix_id: u64,
     clock: u64,
     append_nonce: u64,
@@ -521,6 +522,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             sequences: Vec::new(),
             free_sequence_slots: Vec::new(),
             prefixes: BTreeMap::new(),
+            lru: BTreeSet::new(),
             next_prefix_id: 0,
             clock: 0,
             append_nonce: 0,
@@ -528,7 +530,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             deferred_pages: 0,
             not_sync: PhantomData,
         };
-        cache.refresh_derived_stats()?;
+        cache.refresh_stats()?;
         Ok(cache)
     }
 
@@ -589,12 +591,18 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
 
         let result = found.and_then(|entry_id| {
             let clock = self.tick();
-            let entry = self.prefixes.get_mut(&entry_id)?;
-            entry.last_used = clock;
+            let (last_used, position, page_count) = {
+                let entry = self.prefixes.get_mut(&entry_id)?;
+                let last_used = entry.last_used;
+                entry.last_used = clock;
+                (last_used, entry.position, entry.pages.len())
+            };
+            self.lru.remove(&(last_used, entry_id));
+            self.lru.insert((clock, entry_id));
             Some(PrefixMatch {
                 entry: entry_id,
-                position: entry.position,
-                page_count: entry.pages.len(),
+                position,
+                page_count,
             })
         });
         if let Some(hit) = result {
@@ -679,6 +687,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             return Ok(AdmissionOutcome::WouldBlock);
         };
         self.prepare_sequence_slot()?;
+        for page in &shared_pages {
+            self.page_record(*page)?
+                .active_refs
+                .checked_add(1)
+                .ok_or(CacheError::ArithmeticOverflow)?;
+        }
 
         let snapshot = prefix_id.map(|id| &self.prefixes[&id].snapshot);
         let restore_started = Instant::now();
@@ -697,11 +711,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
 
         self.commit_evictions(&evictions, context)?;
         for page in &shared_pages {
-            self.page_record_mut(*page)?.active_refs = self
-                .page_record(*page)?
-                .active_refs
-                .checked_add(1)
-                .ok_or(CacheError::ArithmeticOverflow)?;
+            self.increment_active_ref(*page)?;
         }
         let id = self.insert_sequence(SequenceRecord {
             pages: shared_pages,
@@ -767,6 +777,13 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         if new_page_count > reserved_pages {
             return Err(CacheError::Invariant("append exceeds admitted reservation"));
         }
+        let next_reserved_pages = self
+            .stats
+            .reserved_pages
+            .checked_sub(new_page_count)
+            .ok_or(CacheError::Invariant(
+                "append exceeds globally reserved pages",
+            ))?;
         self.prepare_page_slots(new_page_count)?;
         let nonce = self.next_append_nonce()?;
 
@@ -899,6 +916,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         let record = self.sequence_record_mut(sequence)?;
         record.reserved_pages -= new_page_count;
         record.pending = Some(pending);
+        self.stats.reserved_pages = next_reserved_pages;
         self.refresh_stats()?;
         Ok(AppendReservation {
             sequence,
@@ -996,6 +1014,16 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                     "partial commit page count moved backwards",
                 ))?;
         let (kept_new_pages, released_pages) = new_pages.split_at(kept_new_page_count);
+        let next_reserved_pages = self
+            .stats
+            .reserved_pages
+            .checked_add(released_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let next_sequence_reserved_pages = self
+            .sequence_record(reservation.sequence)?
+            .reserved_pages
+            .checked_add(released_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
         let mut committed_pages = old_pages;
         committed_pages.extend_from_slice(kept_new_pages);
         let committed_segments = reservation
@@ -1066,12 +1094,10 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         }
         let sequence = self.sequence_record_mut(reservation.sequence)?;
         sequence.pages.extend_from_slice(kept_new_pages);
-        sequence.reserved_pages = sequence
-            .reserved_pages
-            .checked_add(released_pages.len())
-            .ok_or(CacheError::ArithmeticOverflow)?;
+        sequence.reserved_pages = next_sequence_reserved_pages;
         sequence.position = new_position;
         debug_assert!(sequence.pending.is_none());
+        self.stats.reserved_pages = next_reserved_pages;
         self.metrics
             .pages_sealed
             .add(sealed_ids.len().min(isize::MAX as usize) as isize);
@@ -1101,6 +1127,16 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 sequence.position,
             )
         };
+        let next_reserved_pages = self
+            .stats
+            .reserved_pages
+            .checked_add(new_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let next_sequence_reserved_pages = self
+            .sequence_record(reservation.sequence)?
+            .reserved_pages
+            .checked_add(new_pages.len())
+            .ok_or(CacheError::ArithmeticOverflow)?;
         let mut pending = self
             .sequence_record_mut(reservation.sequence)?
             .pending
@@ -1138,11 +1174,9 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             self.remove_page(*page)?;
         }
         let sequence = self.sequence_record_mut(reservation.sequence)?;
-        sequence.reserved_pages = sequence
-            .reserved_pages
-            .checked_add(new_pages.len())
-            .ok_or(CacheError::ArithmeticOverflow)?;
+        sequence.reserved_pages = next_sequence_reserved_pages;
         debug_assert!(sequence.pending.is_none());
+        self.stats.reserved_pages = next_reserved_pages;
         self.refresh_stats()?;
         Ok(())
     }
@@ -1206,10 +1240,14 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .exact(&tokens[..position], self.config.page_tokens)
         {
             let clock = self.tick();
-            self.prefixes
+            let entry = self
+                .prefixes
                 .get_mut(&existing)
-                .ok_or(CacheError::StalePrefix)?
-                .last_used = clock;
+                .ok_or(CacheError::StalePrefix)?;
+            let last_used = entry.last_used;
+            entry.last_used = clock;
+            self.lru.remove(&(last_used, existing));
+            self.lru.insert((clock, existing));
             self.metrics.prefix_duplicate_insertions.inc();
             self.metrics.insertion_us.record(elapsed_us(started));
             return Ok(RetainOutcome::Duplicate(existing));
@@ -1252,6 +1290,28 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             }
         };
         self.prepare_prefix_id()?;
+        for page in &pages {
+            self.page_record(*page)?
+                .prefix_refs
+                .checked_add(1)
+                .ok_or(CacheError::ArithmeticOverflow)?;
+        }
+        let evicted_snapshot_bytes = evictions.iter().try_fold(0usize, |total, id| {
+            total
+                .checked_add(
+                    self.prefixes
+                        .get(id)
+                        .ok_or(CacheError::StalePrefix)?
+                        .snapshot_bytes,
+                )
+                .ok_or(CacheError::ArithmeticOverflow)
+        })?;
+        let retained_snapshot_bytes = self
+            .stats
+            .retained_snapshot_bytes
+            .checked_sub(evicted_snapshot_bytes)
+            .and_then(|bytes| bytes.checked_add(snapshot_bytes))
+            .ok_or(CacheError::ArithmeticOverflow)?;
         if let Err(error) = self.commit_evictions(&evictions, context) {
             self.index.rollback_key(prepared);
             return Err(error);
@@ -1263,9 +1323,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .checked_add(1)
             .ok_or(CacheError::IdExhausted("prefix entry"))?;
         for page in &pages {
-            let refs = self.page_record(*page)?.prefix_refs;
-            self.page_record_mut(*page)?.prefix_refs =
-                refs.checked_add(1).ok_or(CacheError::ArithmeticOverflow)?;
+            self.increment_prefix_ref(*page)?;
         }
         self.index.commit_key(&prepared, id);
         let clock = self.tick();
@@ -1281,6 +1339,8 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 last_used: clock,
             },
         );
+        self.lru.insert((clock, id));
+        self.stats.retained_snapshot_bytes = retained_snapshot_bytes;
         self.metrics.prefix_insertions.inc();
         self.refresh_stats()?;
         self.metrics.insertion_us.record(elapsed_us(started));
@@ -1352,6 +1412,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         };
         self.prepare_sequence_slot()?;
         self.prepare_page_slot()?;
+        for page in &shared_pages {
+            self.page_record(*page)?
+                .active_refs
+                .checked_add(1)
+                .ok_or(CacheError::ArithmeticOverflow)?;
+        }
         let copied_id = self.peek_page_id()?;
         let (backend, page_slots) = (&mut self.backend, &self.pages);
         let source_physical = page_record_from::<B>(page_slots, source_tail)?
@@ -1379,9 +1445,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         }
         self.commit_evictions(&evictions, context)?;
         for page in &shared_pages {
-            let refs = self.page_record(*page)?.active_refs;
-            self.page_record_mut(*page)?.active_refs =
-                refs.checked_add(1).ok_or(CacheError::ArithmeticOverflow)?;
+            self.increment_active_ref(*page)?;
         }
         let copied_id_actual = self.insert_page(PageRecord {
             physical: Some(copied),
@@ -1438,15 +1502,16 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             }
         }
         self.retire_page_ids(&retire_ids, context)?;
+        let mut retired = retire_ids.iter();
+        let mut next_retired = retired.next();
         for page in &pages {
-            if retire_ids.contains(page) {
+            if next_retired == Some(page) {
+                next_retired = retired.next();
                 continue;
             }
-            let refs = self.page_record(*page)?.active_refs;
-            self.page_record_mut(*page)?.active_refs = refs
-                .checked_sub(1)
-                .ok_or(CacheError::Invariant("missing active page reference"))?;
+            self.decrement_active_ref(*page)?;
         }
+        debug_assert!(next_retired.is_none());
         self.remove_sequence(sequence)?;
         self.refresh_stats()?;
         Ok(())
@@ -1586,6 +1651,15 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 "cached accounting differs from ownership",
             ));
         }
+        if self.lru.len() != self.prefixes.len()
+            || self.lru.iter().any(|(last_used, id)| {
+                self.prefixes
+                    .get(id)
+                    .is_none_or(|entry| entry.last_used != *last_used)
+            })
+        {
+            return Err(CacheError::Invariant("LRU index differs from prefixes"));
+        }
         if self.metrics.active_sequences.get() != self.stats.active_sequences as i64
             || self.metrics.retained_prefix_entries.get()
                 != self.stats.retained_prefix_entries as i64
@@ -1666,16 +1740,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             return Ok(Some(Vec::new()));
         }
 
-        let mut candidates = self
-            .prefixes
-            .iter()
-            .filter(|(id, _)| Some(**id) != protected)
-            .map(|(id, entry)| (*id, entry.last_used))
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|(id, last_used)| (*last_used, *id));
         let mut removed_page_refs: HashMap<PageId, usize> = HashMap::new();
         let mut plan = Vec::new();
-        for (id, _) in candidates {
+        for (_, id) in self.lru.iter().copied() {
+            if Some(id) == protected {
+                continue;
+            }
             let entry = &self.prefixes[&id];
             snapshots = snapshots
                 .checked_sub(entry.snapshot_bytes)
@@ -1720,8 +1790,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         }
         let started = Instant::now();
         let mut removed_refs: HashMap<PageId, usize> = HashMap::new();
+        let mut removed_snapshot_bytes = 0usize;
         for id in entries {
             let entry = self.prefixes.get(id).ok_or(CacheError::StalePrefix)?;
+            removed_snapshot_bytes = removed_snapshot_bytes
+                .checked_add(entry.snapshot_bytes)
+                .ok_or(CacheError::ArithmeticOverflow)?;
             for page in &entry.pages {
                 *removed_refs.entry(*page).or_default() += 1;
             }
@@ -1737,22 +1811,29 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .len()
             .checked_mul(self.page_bytes)
             .ok_or(CacheError::ArithmeticOverflow)?;
+        let retained_snapshot_bytes = self
+            .stats
+            .retained_snapshot_bytes
+            .checked_sub(removed_snapshot_bytes)
+            .ok_or(CacheError::Invariant(
+                "evicted snapshots exceed retained accounting",
+            ))?;
+        let retired: HashSet<_> = retire_ids.iter().copied().collect();
         self.retire_page_ids(&retire_ids, context)?;
 
         for id in entries {
             let entry = self.prefixes.remove(id).ok_or(CacheError::StalePrefix)?;
+            self.lru.remove(&(entry.last_used, *id));
             self.index.remove(&entry.key, &entry.blocks);
             for page in entry.pages {
-                if retire_ids.contains(&page) {
+                if retired.contains(&page) {
                     continue;
                 }
-                let refs = self.page_record(page)?.prefix_refs;
-                self.page_record_mut(page)?.prefix_refs = refs
-                    .checked_sub(1)
-                    .ok_or(CacheError::Invariant("missing prefix page reference"))?;
+                self.decrement_prefix_ref(page)?;
             }
             self.metrics.prefix_evictions.inc();
         }
+        self.stats.retained_snapshot_bytes = retained_snapshot_bytes;
         self.metrics
             .bytes_made_reclaimable
             .add(reclaimable.min(isize::MAX as usize) as isize);
@@ -1769,6 +1850,7 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         if ids.is_empty() {
             return Ok(());
         }
+        let mut reclaimable_pages = 0usize;
         for id in ids {
             let slot = self
                 .pages
@@ -1778,15 +1860,25 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             if slot.generation == u32::MAX {
                 return Err(CacheError::IdExhausted("page generation"));
             }
-            if slot
-                .value
-                .as_ref()
-                .and_then(|record| record.physical.as_ref())
-                .is_none()
-            {
+            let record = slot.value.as_ref().ok_or(CacheError::StalePage)?;
+            if record.physical.is_none() {
                 return Err(CacheError::StalePage);
             }
+            reclaimable_pages = reclaimable_pages
+                .checked_add(usize::from(is_reclaimable(record)))
+                .ok_or(CacheError::ArithmeticOverflow)?;
         }
+        let reclaimable_prefix_only_bytes = self
+            .stats
+            .reclaimable_prefix_only_bytes
+            .checked_sub(
+                reclaimable_pages
+                    .checked_mul(self.page_bytes)
+                    .ok_or(CacheError::ArithmeticOverflow)?,
+            )
+            .ok_or(CacheError::Invariant(
+                "retired pages exceed reclaimable accounting",
+            ))?;
         let mut physical = Vec::with_capacity(ids.len());
         for id in ids {
             physical.push(
@@ -1811,13 +1903,15 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 "backend deferred more pages than were retired",
             ));
         }
-        self.deferred_pages = self
+        let deferred_pages = self
             .deferred_pages
             .checked_add(outcome.deferred_pages)
             .ok_or(CacheError::ArithmeticOverflow)?;
         for id in ids {
             self.remove_page(*id)?;
         }
+        self.deferred_pages = deferred_pages;
+        self.stats.reclaimable_prefix_only_bytes = reclaimable_prefix_only_bytes;
         self.metrics
             .pages_retired
             .add(ids.len().min(isize::MAX as usize) as isize);
@@ -1833,12 +1927,18 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 .collect::<Vec<_>>();
             order.sort_by_key(|(id, timestamp)| (*timestamp, *id));
             for (index, (id, _)) in order.into_iter().enumerate() {
+                let last_used = index as u64 + 1;
                 self.prefixes
                     .get_mut(&id)
                     .expect("retained entry")
-                    .last_used = index as u64 + 1;
+                    .last_used = last_used;
             }
             self.clock = self.prefixes.len() as u64;
+            self.lru = self
+                .prefixes
+                .iter()
+                .map(|(id, entry)| (entry.last_used, *id))
+                .collect();
         }
         self.clock += 1;
         self.clock
@@ -1907,6 +2007,89 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .ok_or(CacheError::StaleSequence)
     }
 
+    fn increment_active_ref(&mut self, id: PageId) -> Result<(), B::Error> {
+        let page = self.page_record(id)?;
+        let active_refs = page
+            .active_refs
+            .checked_add(1)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let reclaimable_prefix_only_bytes = if is_reclaimable(page) {
+            self.stats
+                .reclaimable_prefix_only_bytes
+                .checked_sub(self.page_bytes)
+                .ok_or(CacheError::Invariant(
+                    "shared page missing from reclaimable accounting",
+                ))?
+        } else {
+            self.stats.reclaimable_prefix_only_bytes
+        };
+        self.page_record_mut(id)?.active_refs = active_refs;
+        self.stats.reclaimable_prefix_only_bytes = reclaimable_prefix_only_bytes;
+        Ok(())
+    }
+
+    fn decrement_active_ref(&mut self, id: PageId) -> Result<(), B::Error> {
+        let page = self.page_record(id)?;
+        let active_refs = page
+            .active_refs
+            .checked_sub(1)
+            .ok_or(CacheError::Invariant("missing active page reference"))?;
+        let becomes_reclaimable = active_refs == 0 && page.prefix_refs != 0;
+        let reclaimable_prefix_only_bytes = if becomes_reclaimable {
+            self.stats
+                .reclaimable_prefix_only_bytes
+                .checked_add(self.page_bytes)
+                .ok_or(CacheError::ArithmeticOverflow)?
+        } else {
+            self.stats.reclaimable_prefix_only_bytes
+        };
+        self.page_record_mut(id)?.active_refs = active_refs;
+        self.stats.reclaimable_prefix_only_bytes = reclaimable_prefix_only_bytes;
+        Ok(())
+    }
+
+    fn increment_prefix_ref(&mut self, id: PageId) -> Result<(), B::Error> {
+        let page = self.page_record(id)?;
+        let was_unowned = page.active_refs == 0 && page.prefix_refs == 0;
+        let prefix_refs = page
+            .prefix_refs
+            .checked_add(1)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let reclaimable_prefix_only_bytes = if was_unowned {
+            self.stats
+                .reclaimable_prefix_only_bytes
+                .checked_add(self.page_bytes)
+                .ok_or(CacheError::ArithmeticOverflow)?
+        } else {
+            self.stats.reclaimable_prefix_only_bytes
+        };
+        self.page_record_mut(id)?.prefix_refs = prefix_refs;
+        self.stats.reclaimable_prefix_only_bytes = reclaimable_prefix_only_bytes;
+        Ok(())
+    }
+
+    fn decrement_prefix_ref(&mut self, id: PageId) -> Result<(), B::Error> {
+        let page = self.page_record(id)?;
+        let was_reclaimable = is_reclaimable(page);
+        let prefix_refs = page
+            .prefix_refs
+            .checked_sub(1)
+            .ok_or(CacheError::Invariant("missing prefix page reference"))?;
+        let reclaimable_prefix_only_bytes = if was_reclaimable && prefix_refs == 0 {
+            self.stats
+                .reclaimable_prefix_only_bytes
+                .checked_sub(self.page_bytes)
+                .ok_or(CacheError::Invariant(
+                    "shared page missing from reclaimable accounting",
+                ))?
+        } else {
+            self.stats.reclaimable_prefix_only_bytes
+        };
+        self.page_record_mut(id)?.prefix_refs = prefix_refs;
+        self.stats.reclaimable_prefix_only_bytes = reclaimable_prefix_only_bytes;
+        Ok(())
+    }
+
     fn prepare_page_slot(&self) -> Result<(), B::Error> {
         if self.free_page_slots.is_empty() && self.pages.len() > u32::MAX as usize {
             return Err(CacheError::IdExhausted("page slot"));
@@ -1937,10 +2120,11 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     fn insert_page(&mut self, value: PageRecord<B::Page>) -> Result<PageId, B::Error> {
-        if let Some(slot) = self.free_page_slots.pop() {
+        debug_assert!(!is_reclaimable(&value));
+        let id = if let Some(slot) = self.free_page_slots.pop() {
             let id = PageId::new(slot, self.pages[slot].generation);
             self.pages[slot].value = Some(value);
-            Ok(id)
+            id
         } else {
             self.prepare_page_slot()?;
             let slot = self.pages.len();
@@ -1948,11 +2132,13 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 generation: 0,
                 value: Some(value),
             });
-            Ok(PageId::new(slot, 0))
-        }
+            PageId::new(slot, 0)
+        };
+        Ok(id)
     }
 
     fn insert_page_prepared(&mut self, value: PageRecord<B::Page>) -> PageId {
+        debug_assert!(!is_reclaimable(&value));
         if let Some(slot) = self.free_page_slots.pop() {
             let id = PageId::new(slot, self.pages[slot].generation);
             self.pages[slot].value = Some(value);
@@ -1974,11 +2160,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .get_mut(id.slot())
             .filter(|slot| slot.generation == id.generation)
             .ok_or(CacheError::StalePage)?;
-        slot.value.take().ok_or(CacheError::StalePage)?;
-        slot.generation = slot
+        let next_generation = slot
             .generation
             .checked_add(1)
             .ok_or(CacheError::IdExhausted("page generation"))?;
+        slot.value.take().ok_or(CacheError::StalePage)?;
+        slot.generation = next_generation;
         self.free_page_slots.push(id.slot());
         Ok(())
     }
@@ -1994,10 +2181,25 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         &mut self,
         value: SequenceRecord<B::AppendTransaction>,
     ) -> Result<SequenceId, B::Error> {
-        if let Some(slot) = self.free_sequence_slots.pop() {
+        let reserved_pages = self
+            .stats
+            .reserved_pages
+            .checked_add(value.reserved_pages)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let active_private_state_bytes = self
+            .stats
+            .active_private_state_bytes
+            .checked_add(value.private_state_bytes)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let page_table_bytes = self
+            .stats
+            .page_table_bytes
+            .checked_add(value.page_table_bytes)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let id = if let Some(slot) = self.free_sequence_slots.pop() {
             let id = SequenceId::new(slot, self.sequences[slot].generation);
             self.sequences[slot].value = Some(value);
-            Ok(id)
+            id
         } else {
             self.prepare_sequence_slot()?;
             let slot = self.sequences.len();
@@ -2005,8 +2207,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
                 generation: 0,
                 value: Some(value),
             });
-            Ok(SequenceId::new(slot, 0))
-        }
+            SequenceId::new(slot, 0)
+        };
+        self.stats.reserved_pages = reserved_pages;
+        self.stats.active_private_state_bytes = active_private_state_bytes;
+        self.stats.page_table_bytes = page_table_bytes;
+        Ok(id)
     }
 
     fn remove_sequence(&mut self, id: SequenceId) -> Result<(), B::Error> {
@@ -2015,12 +2221,38 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             .get_mut(id.slot())
             .filter(|slot| slot.generation == id.generation)
             .ok_or(CacheError::StaleSequence)?;
-        slot.value.take().ok_or(CacheError::StaleSequence)?;
-        slot.generation = slot
+        let next_generation = slot
             .generation
             .checked_add(1)
             .ok_or(CacheError::IdExhausted("sequence generation"))?;
+        let record = slot.value.as_ref().ok_or(CacheError::StaleSequence)?;
+        let reserved_pages = self
+            .stats
+            .reserved_pages
+            .checked_sub(record.reserved_pages)
+            .ok_or(CacheError::Invariant(
+                "removed sequence exceeds reserved accounting",
+            ))?;
+        let active_private_state_bytes = self
+            .stats
+            .active_private_state_bytes
+            .checked_sub(record.private_state_bytes)
+            .ok_or(CacheError::Invariant(
+                "removed sequence exceeds private-state accounting",
+            ))?;
+        let page_table_bytes = self
+            .stats
+            .page_table_bytes
+            .checked_sub(record.page_table_bytes)
+            .ok_or(CacheError::Invariant(
+                "removed sequence exceeds page-table accounting",
+            ))?;
+        slot.value.take().expect("checked above");
+        slot.generation = next_generation;
         self.free_sequence_slots.push(id.slot());
+        self.stats.reserved_pages = reserved_pages;
+        self.stats.active_private_state_bytes = active_private_state_bytes;
+        self.stats.page_table_bytes = page_table_bytes;
         Ok(())
     }
 
@@ -2138,13 +2370,54 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     }
 
     fn refresh_stats(&mut self) -> Result<(), B::Error> {
-        self.stats = self.compute_stats()?;
+        let owned_resident_pages = self
+            .pages
+            .len()
+            .checked_sub(self.free_page_slots.len())
+            .ok_or(CacheError::Invariant("free page slots exceed page arena"))?;
+        self.stats.resident_pages = owned_resident_pages
+            .checked_add(self.deferred_pages)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        self.stats.active_sequences = self
+            .sequences
+            .len()
+            .checked_sub(self.free_sequence_slots.len())
+            .ok_or(CacheError::Invariant(
+                "free sequence slots exceed sequence arena",
+            ))?;
+        self.stats.retained_prefix_entries = self.prefixes.len();
+        self.stats.interned_token_blocks = self.index.block_count();
+        self.stats.deferred_retirement_pages = self.deferred_pages;
+        self.stats.unique_resident_page_bytes = self
+            .stats
+            .resident_pages
+            .checked_mul(self.page_bytes)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        self.stats.outstanding_reservation_bytes = self
+            .stats
+            .reserved_pages
+            .checked_mul(self.page_bytes)
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        self.stats.total_managed_bytes = self
+            .stats
+            .unique_resident_page_bytes
+            .checked_add(self.stats.outstanding_reservation_bytes)
+            .and_then(|total| total.checked_add(self.stats.active_private_state_bytes))
+            .and_then(|total| total.checked_add(self.stats.retained_snapshot_bytes))
+            .and_then(|total| total.checked_add(self.stats.page_table_bytes))
+            .ok_or(CacheError::ArithmeticOverflow)?;
+        let uncommitted_bytes = self
+            .config
+            .max_managed_bytes
+            .saturating_sub(self.stats.total_managed_bytes);
+        let free_page_slots = self.page_capacity.saturating_sub(
+            self.stats
+                .resident_pages
+                .saturating_add(self.stats.reserved_pages),
+        );
+        self.stats.free_pages = (uncommitted_bytes / self.page_bytes).min(free_page_slots);
         self.publish_gauges();
         Ok(())
-    }
-
-    fn refresh_derived_stats(&mut self) -> Result<(), B::Error> {
-        self.refresh_stats()
     }
 
     fn publish_gauges(&self) {
@@ -2240,6 +2513,10 @@ fn physical_refs_from<'a, B: PageBackend>(
                 .ok_or(CacheError::StalePage)
         })
         .collect()
+}
+
+fn is_reclaimable<P>(page: &PageRecord<P>) -> bool {
+    page.active_refs == 0 && page.prefix_refs != 0
 }
 
 fn div_ceil<E>(value: usize, divisor: usize) -> Result<usize, E> {
@@ -2393,5 +2670,9 @@ mod tests {
         assert_eq!(cache.tick(), 3);
         assert_eq!(cache.prefixes[&older].last_used, 1);
         assert_eq!(cache.prefixes[&newer].last_used, 2);
+        assert_eq!(
+            cache.lru.iter().copied().collect::<Vec<_>>(),
+            vec![(1, older), (2, newer)]
+        );
     }
 }

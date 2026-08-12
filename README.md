@@ -603,9 +603,18 @@ and accounting overhead with a storage-free backend:
 cargo bench --bench seqcache
 ```
 
-It includes one-page and sixteen-page append transactions, a 2,048-row append starting in a partial
-128-token page, exact and partial commit lifecycles, retained-prefix lookup and restore, and
-copy-on-write branching.
+It includes focused measurements for:
+
+- cache construction, stats snapshots, cacheable-position arithmetic, page-table views, and page
+  handle resolution;
+- single- and multi-page reservation access, batched reservation access, reserve/abort, exact
+  commit, and partial commit;
+- cold admission and cancellation, capacity rejection, sequence finish, and page retirement;
+- one-page and production-shaped retained-prefix hits, early and late misses, exact membership,
+  insertion, duplicate retention, eviction, and restoration;
+- copy-on-write branching; and
+- deferred-reclamation polling, exact-accounting refresh, and invariant-validation scaling across
+  different live-state sizes.
 
 These measurements intentionally exclude physical allocation, device synchronization, model
 execution, and KV writes. Backend-specific projects should add separate benchmarks for those costs.

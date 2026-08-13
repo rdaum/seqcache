@@ -1,7 +1,7 @@
 use seqcache::{
-    AdmissionOutcome, AdmissionRequest, BackendAppendPage, CacheConfig, CacheError, PageAllocation,
-    PageBackend, RetainOutcome, RetainedSnapshot, RetireError, RetireOutcome, SequenceCache,
-    SequenceId,
+    AdmissionOutcome, AdmissionRequest, AppendBatchRequest, BackendAppendPage, CacheConfig,
+    CacheError, PageAllocation, PageBackend, RetainOutcome, RetainedSnapshot, RetireError,
+    RetireOutcome, SequenceCache, SequenceId,
 };
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -55,6 +55,7 @@ struct FakeBackend {
     retirements: usize,
     rollbacks: usize,
     fail_next: Option<Operation>,
+    fail_operation_after: Option<(Operation, usize)>,
     fail_allocation_after: Option<usize>,
     immediate_retirement: bool,
     deferred_pages: usize,
@@ -73,6 +74,7 @@ impl FakeBackend {
             retirements: 0,
             rollbacks: 0,
             fail_next: None,
+            fail_operation_after: None,
             fail_allocation_after: None,
             immediate_retirement: true,
             deferred_pages: 0,
@@ -96,6 +98,10 @@ impl FakeBackend {
         self.fail_allocation_after = Some(successful_allocations);
     }
 
+    fn fail_operation_after(&mut self, operation: Operation, successful_operations: usize) {
+        self.fail_operation_after = Some((operation, successful_operations));
+    }
+
     fn with_page_capacity(mut self, page_capacity: usize) -> Self {
         self.page_capacity = Some(page_capacity);
         self
@@ -105,6 +111,16 @@ impl FakeBackend {
         if self.fail_next == Some(operation) {
             self.fail_next = None;
             Err(FakeError(operation))
+        } else if let Some((target, remaining)) = &mut self.fail_operation_after
+            && *target == operation
+        {
+            if *remaining == 0 {
+                self.fail_operation_after = None;
+                Err(FakeError(operation))
+            } else {
+                *remaining -= 1;
+                Ok(())
+            }
         } else {
             Ok(())
         }
@@ -535,6 +551,236 @@ fn batched_append_lease_preserves_reservation_and_segment_order() {
         .abort_append(second_reservation, &mut second_context)
         .expect("abort second");
     cache.validate().expect("valid after batched lease");
+}
+
+#[test]
+fn append_batch_reserves_accesses_and_commits_in_caller_order() {
+    let mut cache = cache(4_000);
+    let mut contexts = [FakeContext::default(), FakeContext::default()];
+    let first = admit(&mut cache, 16, &mut contexts[0]);
+    let second = admit(&mut cache, 16, &mut contexts[1]);
+    let requests = [
+        AppendBatchRequest::new(first, 7),
+        AppendBatchRequest::new(second, 3),
+    ];
+
+    let batch = cache
+        .reserve_append_batch(&requests, &mut contexts)
+        .expect("reserve batch");
+    assert_eq!(batch.len(), 2);
+    assert_eq!(batch[0].sequence(), first);
+    assert_eq!(batch[1].sequence(), second);
+    cache
+        .with_append_reservations(&batch, |_backend, reservations| {
+            let geometry = reservations
+                .iter()
+                .map(|pages| {
+                    pages
+                        .iter()
+                        .map(|page| {
+                            let segment = page.segment();
+                            page.page()
+                                .rows
+                                .borrow_mut()
+                                .resize(segment.page_offset() + segment.rows(), 7);
+                            (
+                                segment.page_offset(),
+                                segment.input_offset(),
+                                segment.rows(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(geometry[0], [(0, 0, 4), (0, 4, 3)]);
+            assert_eq!(geometry[1], [(0, 0, 3)]);
+            Ok(())
+        })
+        .expect("access batch");
+    cache
+        .commit_append_batch(batch, &[7, 3], &mut contexts)
+        .expect("commit batch");
+
+    assert_eq!(cache.page_table(first).expect("first table").position(), 7);
+    assert_eq!(
+        cache.page_table(second).expect("second table").position(),
+        3
+    );
+    assert_eq!(contexts[0].position, 7);
+    assert_eq!(contexts[1].position, 3);
+    cache.validate().expect("valid committed batch");
+}
+
+#[test]
+fn failed_batch_reservation_returns_only_the_published_pending_prefix() {
+    let mut cache = cache(4_000);
+    let mut contexts = [
+        FakeContext::default(),
+        FakeContext::default(),
+        FakeContext::default(),
+    ];
+    let sequences = [
+        admit(&mut cache, 8, &mut contexts[0]),
+        admit(&mut cache, 8, &mut contexts[1]),
+        admit(&mut cache, 8, &mut contexts[2]),
+    ];
+    let requests = sequences.map(|sequence| AppendBatchRequest::new(sequence, 4));
+    let before = cache.stats();
+    cache.with_backend(|backend| backend.fail_operation_after(Operation::Update, 1));
+
+    let failure = cache
+        .reserve_append_batch(&requests, &mut contexts)
+        .expect_err("second page-table publication fails");
+    assert_eq!(failure.failed_index(), Some(1));
+    assert!(matches!(
+        failure.error(),
+        CacheError::Backend(FakeError(Operation::Update))
+    ));
+    assert_eq!(failure.pending().len(), 1);
+    assert_eq!(failure.pending()[0].sequence(), sequences[0]);
+    assert_eq!(contexts[0].table.len(), 1);
+    assert!(contexts[1].table.is_empty());
+    assert!(contexts[2].table.is_empty());
+    cache.validate().expect("valid partially reserved batch");
+
+    let (_, pending, _) = failure.into_parts();
+    cache
+        .abort_append_batch(pending, &mut contexts[..1])
+        .expect("abort published prefix");
+    assert_eq!(cache.stats(), before);
+    cache.validate().expect("valid after batch rollback");
+}
+
+#[test]
+fn failed_batch_commit_returns_the_failed_and_unattempted_reservations() {
+    let mut cache = cache(4_000);
+    let mut contexts = [
+        FakeContext::default(),
+        FakeContext::default(),
+        FakeContext::default(),
+    ];
+    let sequences = [
+        admit(&mut cache, 8, &mut contexts[0]),
+        admit(&mut cache, 8, &mut contexts[1]),
+        admit(&mut cache, 8, &mut contexts[2]),
+    ];
+    let requests = sequences.map(|sequence| AppendBatchRequest::new(sequence, 4));
+    let batch = cache
+        .reserve_append_batch(&requests, &mut contexts)
+        .expect("reserve batch");
+    cache.with_backend(|backend| backend.fail_operation_after(Operation::Commit, 1));
+
+    let failure = cache
+        .commit_append_batch(batch, &[4, 4, 4], &mut contexts)
+        .expect_err("second commit fails");
+    assert_eq!(failure.failed_index(), Some(1));
+    assert!(matches!(
+        failure.error(),
+        CacheError::Backend(FakeError(Operation::Commit))
+    ));
+    assert_eq!(
+        failure
+            .pending()
+            .iter()
+            .map(|reservation| reservation.sequence())
+            .collect::<Vec<_>>(),
+        &sequences[1..]
+    );
+    assert_eq!(cache.page_table(sequences[0]).expect("table").position(), 4);
+    assert_eq!(cache.page_table(sequences[1]).expect("table").position(), 0);
+    assert_eq!(cache.page_table(sequences[2]).expect("table").position(), 0);
+    cache.validate().expect("valid partial batch commit");
+
+    let (_, pending, _) = failure.into_parts();
+    cache
+        .commit_append_batch(pending, &[4, 4], &mut contexts[1..])
+        .expect("retry pending suffix");
+    assert!(
+        sequences
+            .iter()
+            .all(|sequence| cache.page_table(*sequence).expect("table").position() == 4)
+    );
+    cache.validate().expect("valid retried batch commit");
+}
+
+#[test]
+fn failed_batch_abort_returns_the_failed_and_unattempted_reservations() {
+    let mut cache = cache(4_000);
+    let mut contexts = [
+        FakeContext::default(),
+        FakeContext::default(),
+        FakeContext::default(),
+    ];
+    let sequences = [
+        admit(&mut cache, 8, &mut contexts[0]),
+        admit(&mut cache, 8, &mut contexts[1]),
+        admit(&mut cache, 8, &mut contexts[2]),
+    ];
+    let requests = sequences.map(|sequence| AppendBatchRequest::new(sequence, 4));
+    let before = cache.stats();
+    let batch = cache
+        .reserve_append_batch(&requests, &mut contexts)
+        .expect("reserve batch");
+    cache.with_backend(|backend| backend.fail_operation_after(Operation::Abort, 1));
+
+    let failure = cache
+        .abort_append_batch(batch, &mut contexts)
+        .expect_err("second abort fails");
+    assert_eq!(failure.failed_index(), Some(1));
+    assert!(matches!(
+        failure.error(),
+        CacheError::Backend(FakeError(Operation::Abort))
+    ));
+    assert_eq!(
+        failure
+            .pending()
+            .iter()
+            .map(|reservation| reservation.sequence())
+            .collect::<Vec<_>>(),
+        &sequences[1..]
+    );
+    assert!(contexts[0].table.is_empty());
+    assert_eq!(contexts[1].table.len(), 1);
+    assert_eq!(contexts[2].table.len(), 1);
+    cache.validate().expect("valid partial batch abort");
+
+    let (_, pending, _) = failure.into_parts();
+    cache
+        .abort_append_batch(pending, &mut contexts[1..])
+        .expect("retry pending aborts");
+    assert_eq!(cache.stats(), before);
+    cache.validate().expect("valid retried batch abort");
+}
+
+#[test]
+fn batch_size_mismatch_returns_every_still_pending_reservation() {
+    let mut cache = cache(4_000);
+    let mut contexts = [FakeContext::default(), FakeContext::default()];
+    let first = admit(&mut cache, 8, &mut contexts[0]);
+    let second = admit(&mut cache, 8, &mut contexts[1]);
+    let requests = [
+        AppendBatchRequest::new(first, 4),
+        AppendBatchRequest::new(second, 4),
+    ];
+    let batch = cache
+        .reserve_append_batch(&requests, &mut contexts)
+        .expect("reserve batch");
+
+    let failure = cache
+        .commit_append_batch(batch, &[4], &mut contexts)
+        .expect_err("row counts differ in length");
+    assert_eq!(failure.failed_index(), None);
+    assert!(matches!(
+        failure.error(),
+        CacheError::AppendBatchSizeMismatch
+    ));
+    assert_eq!(failure.pending().len(), 2);
+
+    let (_, pending, _) = failure.into_parts();
+    cache
+        .abort_append_batch(pending, &mut contexts)
+        .expect("abort returned pending batch");
+    cache.validate().expect("valid after mismatched batch");
 }
 
 #[test]

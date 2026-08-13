@@ -57,7 +57,9 @@ impl std::error::Error for ConfigError {}
 /// `E` is the associated error type of the configured
 /// [`crate::PageBackend`]. Every variant other than [`CacheError::Backend`]
 /// leaves cache ownership and accounting unchanged; the backend contract makes
-/// the same guarantee for failed storage operations.
+/// the same guarantee for each failed storage operation. Ordered batch methods
+/// wrap this type in [`crate::AppendBatchError`] because earlier sequence
+/// operations may already have completed.
 #[derive(Debug)]
 pub enum CacheError<E> {
     /// The supplied [`crate::CacheConfig`] failed validation.
@@ -88,6 +90,8 @@ pub enum CacheError<E> {
     NoAppendPending,
     /// The append reservation is stale or does not match the pending append.
     AppendReservationMismatch,
+    /// Batch requests, commit row counts, and backend contexts differ in length.
+    AppendBatchSizeMismatch,
     /// The page backend reported a failure.
     Backend(E),
 }
@@ -111,6 +115,7 @@ impl<E: fmt::Display> fmt::Display for CacheError<E> {
             Self::AppendReservationMismatch => {
                 f.write_str("append reservation is stale or mismatched")
             }
+            Self::AppendBatchSizeMismatch => f.write_str("append batch inputs differ in length"),
             Self::Backend(error) => write!(f, "page backend operation failed: {error}"),
         }
     }

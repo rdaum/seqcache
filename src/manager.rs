@@ -12,6 +12,7 @@ use crate::metrics::CacheMetrics;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::time::Instant;
 
 /// Declares a copyable arena handle which rejects reuse after removal.
@@ -212,7 +213,9 @@ impl AppendSegment {
 /// Obtained from [`SequenceCache::reserve_append`] and consumed by exactly one
 /// [`SequenceCache::commit_append`] or [`SequenceCache::abort_append`]. The
 /// embedded nonce makes copied or replayed reservations fail with
-/// [`CacheError::AppendReservationMismatch`].
+/// [`CacheError::AppendReservationMismatch`]. Dropping the value does not
+/// abort the backend transaction; the sequence remains pending.
+#[must_use = "an append reservation must be committed or aborted"]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendReservation {
     sequence: SequenceId,
@@ -242,6 +245,152 @@ impl AppendReservation {
     /// Ordered physical-page segments covering the complete append.
     pub fn segments(&self) -> &[AppendSegment] {
         &self.segments
+    }
+}
+
+/// One requested sequence span in a batch append reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendBatchRequest {
+    sequence: SequenceId,
+    rows: usize,
+}
+
+impl AppendBatchRequest {
+    /// Request `rows` writable positions for `sequence`.
+    pub fn new(sequence: SequenceId, rows: usize) -> Self {
+        Self { sequence, rows }
+    }
+
+    /// Sequence the requested append belongs to.
+    pub fn sequence(self) -> SequenceId {
+        self.sequence
+    }
+
+    /// Exact number of writable rows requested.
+    pub fn rows(self) -> usize {
+        self.rows
+    }
+}
+
+/// Ordered capabilities for one batch of pending append transactions.
+///
+/// Obtained from [`SequenceCache::reserve_append_batch`] and consumed by
+/// exactly one [`SequenceCache::commit_append_batch`] or
+/// [`SequenceCache::abort_append_batch`]. Batch finalization follows caller
+/// order and is deliberately not described as atomic across sequences.
+/// Dropping the value does not abort its backend transactions; every affected
+/// sequence remains pending.
+#[must_use = "an append batch must be committed or aborted"]
+#[derive(Debug)]
+pub struct AppendBatch {
+    reservations: Box<[AppendReservation]>,
+}
+
+impl AppendBatch {
+    fn new(reservations: Vec<AppendReservation>) -> Self {
+        Self {
+            reservations: reservations.into_boxed_slice(),
+        }
+    }
+
+    /// Number of independently pending sequence appends.
+    pub fn len(&self) -> usize {
+        self.reservations.len()
+    }
+
+    /// Whether this batch contains no pending appends.
+    pub fn is_empty(&self) -> bool {
+        self.reservations.is_empty()
+    }
+
+    /// Pending reservations in the original caller order.
+    pub fn reservations(&self) -> &[AppendReservation] {
+        &self.reservations
+    }
+}
+
+impl Deref for AppendBatch {
+    type Target = [AppendReservation];
+
+    fn deref(&self) -> &Self::Target {
+        &self.reservations
+    }
+}
+
+/// Failure from a batch reservation, commit, or abort operation.
+///
+/// Since [`crate::PageBackend`] guarantees publication atomicity for one
+/// sequence rather than a whole batch, earlier items may have completed before
+/// an operation fails. `pending` contains exactly the batch-owned
+/// reservations which still match live pending appends and can be retried or
+/// aborted. `failed_index` identifies the caller-order item whose operation
+/// failed; it is `None` when parallel input slices differed in length. The
+/// pending batch must not be discarded: dropping this error also drops that
+/// capability without aborting it.
+#[must_use = "the pending append batch in this error must be retried or aborted"]
+#[derive(Debug)]
+pub struct AppendBatchError<E> {
+    error: CacheError<E>,
+    pending: AppendBatch,
+    failed_index: Option<usize>,
+}
+
+impl<E> AppendBatchError<E> {
+    fn new(error: CacheError<E>, pending: AppendBatch, failed_index: Option<usize>) -> Self {
+        Self {
+            error,
+            pending,
+            failed_index,
+        }
+    }
+
+    /// Underlying validation, ownership, or backend failure.
+    pub fn error(&self) -> &CacheError<E> {
+        &self.error
+    }
+
+    /// Exact batch-owned reservations which remain pending after the failure.
+    pub fn pending(&self) -> &AppendBatch {
+        &self.pending
+    }
+
+    /// Index of the failed caller-order item, when the input lengths matched.
+    pub fn failed_index(&self) -> Option<usize> {
+        self.failed_index
+    }
+
+    /// Split the failure into its cause, pending capabilities, and failed index.
+    pub fn into_parts(self) -> (CacheError<E>, AppendBatch, Option<usize>) {
+        (self.error, self.pending, self.failed_index)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AppendBatchError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(index) = self.failed_index {
+            write!(
+                formatter,
+                "append batch item {index} failed: {}; {} reservations remain pending",
+                self.error,
+                self.pending.len()
+            )
+        } else {
+            write!(
+                formatter,
+                "append batch failed: {}; {} reservations remain pending",
+                self.error,
+                self.pending.len()
+            )
+        }
+    }
+}
+
+impl<E> std::error::Error for AppendBatchError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -927,6 +1076,44 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         })
     }
 
+    /// Reserve and publish an ordered batch of independent sequence appends.
+    ///
+    /// `requests` and `contexts` correspond by index. Each sequence's
+    /// reservation and backend page-table publication completes before the
+    /// next begins; the backend contract does not make publication atomic
+    /// across sequences. If an item fails, the returned
+    /// [`AppendBatchError`] owns every earlier reservation which remains
+    /// pending. The failed item is rolled back by [`SequenceCache::reserve_append`]
+    /// and later items are not attempted.
+    pub fn reserve_append_batch(
+        &mut self,
+        requests: &[AppendBatchRequest],
+        contexts: &mut [B::Context<'_>],
+    ) -> core::result::Result<AppendBatch, AppendBatchError<B::Error>> {
+        if requests.len() != contexts.len() {
+            return Err(AppendBatchError::new(
+                CacheError::AppendBatchSizeMismatch,
+                AppendBatch::new(Vec::new()),
+                None,
+            ));
+        }
+
+        let mut reservations = Vec::with_capacity(requests.len());
+        for (index, (request, context)) in requests.iter().zip(contexts).enumerate() {
+            match self.reserve_append(request.sequence, request.rows, context) {
+                Ok(reservation) => reservations.push(reservation),
+                Err(error) => {
+                    return Err(AppendBatchError::new(
+                        error,
+                        AppendBatch::new(reservations),
+                        Some(index),
+                    ));
+                }
+            }
+        }
+        Ok(AppendBatch::new(reservations))
+    }
+
     /// Borrow every physical page covered by a pending reservation.
     ///
     /// The pages are ordered exactly like the reservation segments. Runtime
@@ -954,7 +1141,8 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
     /// Borrow every physical page covered by several pending reservations.
     ///
     /// Reservation and segment order match the caller's slices, allowing one
-    /// batched model invocation to write directly into several sequences.
+    /// batched model invocation to write directly into several sequences. An
+    /// [`AppendBatch`] dereferences to the expected reservation slice.
     pub fn with_append_reservations<R, F>(
         &mut self,
         reservations: &[AppendReservation],
@@ -1105,6 +1293,59 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(())
     }
 
+    /// Commit one nonempty prefix from every reservation in an ordered batch.
+    ///
+    /// Reservations, committed row counts, and contexts correspond by index.
+    /// Commits complete one sequence at a time in caller order. If one fails,
+    /// earlier successful commits remain committed and the returned
+    /// [`AppendBatchError`] owns exactly those reservations in the supplied
+    /// batch which are still pending, including the failed item and every
+    /// unattempted suffix item.
+    pub fn commit_append_batch(
+        &mut self,
+        batch: AppendBatch,
+        committed_rows: &[usize],
+        contexts: &mut [B::Context<'_>],
+    ) -> core::result::Result<(), AppendBatchError<B::Error>> {
+        let reservations = batch.reservations;
+        if reservations.len() != committed_rows.len() || reservations.len() != contexts.len() {
+            let pending = self.pending_append_batch(&reservations);
+            return Err(AppendBatchError::new(
+                CacheError::AppendBatchSizeMismatch,
+                pending,
+                None,
+            ));
+        }
+
+        for (index, reservation) in reservations.iter().enumerate() {
+            if let Err(error) = self.validate_reservation(reservation) {
+                let pending = self.pending_append_batch(&reservations);
+                return Err(AppendBatchError::new(error, pending, Some(index)));
+            }
+            if committed_rows[index] == 0 || committed_rows[index] > reservation.rows {
+                let pending = self.pending_append_batch(&reservations);
+                return Err(AppendBatchError::new(
+                    CacheError::InvalidPosition,
+                    pending,
+                    Some(index),
+                ));
+            }
+        }
+
+        for (index, ((reservation, rows), context)) in reservations
+            .iter()
+            .zip(committed_rows)
+            .zip(contexts)
+            .enumerate()
+        {
+            if let Err(error) = self.commit_append(reservation.clone(), *rows, context) {
+                let pending = self.pending_append_batch(&reservations);
+                return Err(AppendBatchError::new(error, pending, Some(index)));
+            }
+        }
+        Ok(())
+    }
+
     /// Abort a reservation and restore the exact prior page table.
     ///
     /// If restoring the backend table fails, the reservation remains pending
@@ -1178,6 +1419,44 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         debug_assert!(sequence.pending.is_none());
         self.stats.reserved_pages = next_reserved_pages;
         self.refresh_stats()?;
+        Ok(())
+    }
+
+    /// Abort every reservation in an ordered batch.
+    ///
+    /// Reservations and contexts correspond by index. Aborts complete one
+    /// sequence at a time in caller order. If one fails, earlier successful
+    /// aborts remain complete and the returned [`AppendBatchError`] owns
+    /// exactly those supplied reservations which are still pending, including
+    /// the failed item and every unattempted suffix item.
+    pub fn abort_append_batch(
+        &mut self,
+        batch: AppendBatch,
+        contexts: &mut [B::Context<'_>],
+    ) -> core::result::Result<(), AppendBatchError<B::Error>> {
+        let reservations = batch.reservations;
+        if reservations.len() != contexts.len() {
+            let pending = self.pending_append_batch(&reservations);
+            return Err(AppendBatchError::new(
+                CacheError::AppendBatchSizeMismatch,
+                pending,
+                None,
+            ));
+        }
+
+        for (index, reservation) in reservations.iter().enumerate() {
+            if let Err(error) = self.validate_reservation(reservation) {
+                let pending = self.pending_append_batch(&reservations);
+                return Err(AppendBatchError::new(error, pending, Some(index)));
+            }
+        }
+
+        for (index, (reservation, context)) in reservations.iter().zip(contexts).enumerate() {
+            if let Err(error) = self.abort_append(reservation.clone(), context) {
+                let pending = self.pending_append_batch(&reservations);
+                return Err(AppendBatchError::new(error, pending, Some(index)));
+            }
+        }
         Ok(())
     }
 
@@ -1967,6 +2246,19 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             return Err(CacheError::AppendReservationMismatch);
         }
         Ok(())
+    }
+
+    fn pending_append_batch(&self, reservations: &[AppendReservation]) -> AppendBatch {
+        let mut sequences = HashSet::with_capacity(reservations.len());
+        let pending = reservations
+            .iter()
+            .filter(|reservation| {
+                sequences.insert(reservation.sequence)
+                    && self.validate_reservation(reservation).is_ok()
+            })
+            .cloned()
+            .collect();
+        AppendBatch::new(pending)
     }
 
     fn page_record(&self, id: PageId) -> Result<&PageRecord<B::Page>, B::Error> {

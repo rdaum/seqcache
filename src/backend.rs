@@ -243,7 +243,10 @@ pub trait PageBackend {
     /// Atomically replace a sequence's backend-native page table.
     ///
     /// On failure both the previously published page ordering and position
-    /// must remain unchanged.
+    /// must remain unchanged. This guarantee covers one sequence operation;
+    /// [`crate::SequenceCache::reserve_append_batch`] publishes sequences in
+    /// order and reports partial progress rather than assuming cross-sequence
+    /// atomicity.
     fn update_page_table(
         &mut self,
         pages: &[&Self::Page],

@@ -18,6 +18,8 @@ The changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), 
   finish, prefix-index mutation and lookup scaling, accounting refresh, and invariant validation.
 - Add a feature-gated native `wgpu` backend example with a storage-buffer page slab, a
   device-resident logical page table, and submission-safe page recycling.
+- Add canonical ordered batch append reservation, access, commit, and abort operations. Partial
+  backend failures return the exact reservations which remain pending for retry or rollback.
 - Document the public backend contract, lifecycle invariants, project style, and contribution
   checks.
 

@@ -255,7 +255,7 @@ partial page into a new private tail.
 
 Aligned sequences should normally be represented by retained prefixes rather than `branch`.
 
-## Multi-page append transactions
+## Multi-page and batch append transactions
 
 Physical page size does not limit model execution size. A caller may reserve any positive number of
 rows up to the sequence's admitted maximum position. One reservation can cover:
@@ -299,6 +299,58 @@ After execution, the caller must consume the reservation with exactly one of:
 
 Reservations carry a nonce. A stale, copied, or mismatched reservation cannot commit a different
 pending append.
+
+### Continuous batch lifecycle
+
+`reserve_append_batch` accepts ordered `AppendBatchRequest` and backend-context slices, then returns
+one `AppendBatch`. The batch dereferences to the reservation slice expected by
+`with_append_reservations`, so the runtime can execute one model batch over every ordered span. It
+then consumes the capability with `commit_append_batch` or `abort_append_batch`.
+
+```rust,ignore
+let requests = scheduled
+    .iter()
+    .map(|item| AppendBatchRequest::new(item.sequence, item.rows))
+    .collect::<Vec<_>>();
+let batch = cache.reserve_append_batch(&requests, &mut contexts)?;
+
+let execution = cache.with_append_reservations(&batch, |backend, reservations| {
+    model.execute_batch(backend, reservations)
+});
+
+match execution {
+    Ok(committed_rows) => {
+        if let Err(failure) = cache.commit_append_batch(batch, &committed_rows, &mut contexts) {
+            return scheduler.recover_pending_batch(failure);
+        }
+    }
+    Err(error) => {
+        if let Err(failure) = cache.abort_append_batch(batch, &mut contexts) {
+            return scheduler.recover_pending_batch(failure);
+        }
+        return Err(error.into());
+    }
+}
+```
+
+The backend page-table contract is atomic for one sequence, not across a batch. Reservation, commit,
+and abort therefore proceed in caller order. On failure, `AppendBatchError::failed_index` identifies
+the item which failed when the input lengths matched, and `AppendBatchError::pending` contains
+exactly the batch-owned reservations which remain pending. Earlier reserve operations are returned
+as the pending prefix; after commit or abort failure, earlier successful items stay finalized and
+the failed and unattempted items form the usual pending suffix. Callers can retry or abort the
+returned batch without reconstructing reservation state.
+
+Requests, row counts, and contexts correspond by index. A size mismatch performs no new backend
+operation and returns all still-pending reservations. An empty batch is a valid no-op.
+
+`AppendBatch` and `AppendReservation` are `#[must_use]`, but Rust destructors cannot enforce the
+lifecycle. Dropping either capability does not abort: the cache retains the pending transaction and
+rejects another reservation or sequence finish. Without another clone of each individual
+reservation, dropping the capability loses the public means to finalize those sequences and the
+cache must be discarded. Automatic abort in `Drop` would be unsound because backend abort requires
+the correct mutable contexts and synchronization and can itself fail. Applications should preserve
+`AppendBatchError` until its pending batch has been retried or aborted.
 
 ### Exact and partial commit
 
@@ -543,7 +595,9 @@ reservations, configuration, and backend failures use `CacheError`.
 
 The important recovery rule is that a failed append commit or abort does not discard the pending
 reservation. Once the backend condition is corrected, the caller can retry the operation or abort
-it. Allocation and initial publication failures roll back unpublished pages before returning.
+it. Allocation and initial publication failures roll back unpublished pages before returning. Batch
+operations additionally return an `AppendBatchError` owning the exact reservations which remain
+pending after any earlier per-sequence successes.
 
 Calling `finish` while an append is pending is rejected. The caller must commit or abort the
 reservation first.
@@ -584,8 +638,9 @@ cargo package
 
 The conformance suite uses an in-memory backend with failure injection. It covers multi-page
 reservation geometry, allocation and publication rollback, commit and abort retry behaviour, partial
-commit, page sealing, prefix sharing, copy-on-write, recycling, metrics, generational handle
-staleness, and a deterministic state machine which validates invariants after every operation.
+commit, partial batch publication and finalization, page sealing, prefix sharing, copy-on-write,
+recycling, metrics, generational handle staleness, and a deterministic state machine which validates
+invariants after every operation.
 
 An external backend should reuse the same scenarios against its physical storage and synchronization
 implementation. Passing the manager's in-memory tests does not prove that a device backend obeys

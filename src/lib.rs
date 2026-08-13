@@ -34,7 +34,11 @@
 //!    from [`SequenceCache::lookup_prefix`].
 //! 2. Append tokens with [`SequenceCache::reserve_append`],
 //!    [`SequenceCache::with_append_pages`], and [`SequenceCache::commit_append`]
-//!    (or [`SequenceCache::abort_append`]).
+//!    (or [`SequenceCache::abort_append`]). Continuous batches use
+//!    [`SequenceCache::reserve_append_batch`],
+//!    [`SequenceCache::with_append_reservations`], and
+//!    [`SequenceCache::commit_append_batch`] (or
+//!    [`SequenceCache::abort_append_batch`]).
 //! 3. Reach useful page boundaries, then [`SequenceCache::retain_prefix`] to
 //!    make the prefix reusable.
 //! 4. [`SequenceCache::finish`] the sequence when done.
@@ -56,9 +60,10 @@ pub use backend::{
 };
 pub use error::{CacheError, ConfigError, Result};
 pub use manager::{
-    AdmissionOutcome, AdmissionRequest, AppendPage, AppendPages, AppendReservation,
-    AppendReservations, AppendSegment, CacheConfig, CacheStats, PageId, PageTableView,
-    PrefixEntryId, PrefixMatch, RetainOutcome, SequenceCache, SequenceId, TokenBlockId,
+    AdmissionOutcome, AdmissionRequest, AppendBatch, AppendBatchError, AppendBatchRequest,
+    AppendPage, AppendPages, AppendReservation, AppendReservations, AppendSegment, CacheConfig,
+    CacheStats, PageId, PageTableView, PrefixEntryId, PrefixMatch, RetainOutcome, SequenceCache,
+    SequenceId, TokenBlockId,
 };
 pub use metrics::CacheMetrics;
 

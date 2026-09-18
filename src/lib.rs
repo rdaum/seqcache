@@ -12,8 +12,8 @@
 //! - Sealed pages are immutable and shareable. **Prefix entries** retain a
 //!   page-aligned run of sealed pages plus a runtime-defined
 //!   [`RetainedSnapshot`]; later sequences restore them without copying
-//!   storage. A **branch** copies only the unaligned tail, giving
-//!   copy-on-write sequences.
+//!   storage. A **branch** shares sealed pages directly and copies only an
+//!   unaligned writable tail, giving copy-on-write sequences.
 //! - The prefix index is content-addressed: page-sized token runs are interned
 //!   as **token blocks**, and an adaptive radix tree finds the longest retained
 //!   prefix for a query. Lookups never intern blocks, so speculative probing

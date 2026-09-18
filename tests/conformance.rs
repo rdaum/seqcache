@@ -1254,6 +1254,40 @@ fn unaligned_branch_shares_complete_pages_and_copies_one_tail() {
 }
 
 #[test]
+fn aligned_branch_shares_all_pages_without_copying() {
+    let mut cache = cache(2_000);
+    let mut context = FakeContext::default();
+    let source = admit(&mut cache, 12, &mut context);
+    append(&mut cache, source, &[1, 2, 3, 4, 5, 6, 7, 8], &mut context);
+    let source_pages = cache
+        .page_table(source)
+        .expect("source table")
+        .pages()
+        .to_vec();
+    let branch = match cache
+        .branch(source, request(12), &mut context)
+        .expect("branch")
+    {
+        AdmissionOutcome::Admitted(id) => id,
+        AdmissionOutcome::WouldBlock => panic!("branch should fit"),
+    };
+    let branch_table = cache.page_table(branch).expect("branch table");
+    assert_eq!(branch_table.position(), 8);
+    assert_eq!(branch_table.pages(), source_pages);
+    assert_eq!(cache.backend().copies, 0);
+    assert_eq!(cache.stats().resident_pages, 2);
+    assert_eq!(cache.stats().reserved_pages, 2);
+
+    let mut branch_context = FakeContext::default();
+    append(&mut cache, branch, &[9, 10], &mut branch_context);
+    let extended = cache.page_table(branch).expect("extended branch");
+    assert_eq!(extended.position(), 10);
+    assert_eq!(&extended.pages()[..2], source_pages);
+    assert_eq!(cache.page_table(source).expect("source").position(), 8);
+    cache.validate().expect("valid aligned branch");
+}
+
+#[test]
 fn multi_page_commit_and_recycling_metrics_match_page_transitions() {
     let mut cache = cache(4_000);
     let mut context = FakeContext::default();
@@ -1707,7 +1741,6 @@ fn deterministic_state_machine_recomputes_invariants_after_every_operation() {
                 let index = (seed as usize >> 8) % active.len();
                 let source = active[index].clone();
                 if !source.tokens.is_empty()
-                    && !source.tokens.len().is_multiple_of(4)
                     && let AdmissionOutcome::Admitted(id) = cache
                         .branch(source.id, request(source.max_position), &mut context)
                         .expect("state-machine branch")

@@ -25,6 +25,8 @@ The changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), 
 
 ### Changed
 
+- Allow live-sequence branches at exact page boundaries by sharing all sealed pages without a tail
+  copy.
 - Remove cache-size-dependent work from routine accounting, maintain an ordered LRU prefix index,
   use faster randomized token-block hashing, and avoid quadratic page-membership checks during
   sequence finish and prefix eviction.

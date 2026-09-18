@@ -1644,12 +1644,12 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         Ok(())
     }
 
-    /// Branch an unaligned live sequence, sharing sealed pages and copying one tail.
+    /// Branch a nonempty live sequence, sharing its sealed pages.
     ///
-    /// The new sequence starts at the source's current position. Its complete
-    /// pages are shared with the source; its writable tail is a private
-    /// copy-on-write duplicate, after which the branch is independent. The
-    /// source must not have a pending append.
+    /// The new sequence starts at the source's current position. An aligned
+    /// source shares every page without copying. An unaligned source shares its
+    /// complete pages and receives a private copy-on-write tail. The source must
+    /// not have a pending append.
     pub fn branch(
         &mut self,
         source: SequenceId,
@@ -1663,23 +1663,33 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             }
             (source.position, source.pages.clone())
         };
-        if position == 0 || position.is_multiple_of(self.config.page_tokens) {
+        if position == 0 {
             return Err(CacheError::InvalidPosition);
         }
         if request.max_position < position {
             return Err(CacheError::InvalidPosition);
         }
         let complete_count = position / self.config.page_tokens;
-        let shared_pages = source_pages[..complete_count].to_vec();
-        let source_tail = *source_pages
-            .get(complete_count)
-            .ok_or(CacheError::Invariant("unaligned source has no tail"))?;
+        let shared_pages = source_pages
+            .get(..complete_count)
+            .ok_or(CacheError::Invariant("branch source has too few pages"))?
+            .to_vec();
+        let source_tail = if position.is_multiple_of(self.config.page_tokens) {
+            None
+        } else {
+            Some(
+                *source_pages
+                    .get(complete_count)
+                    .ok_or(CacheError::Invariant("unaligned source has no tail"))?,
+            )
+        };
+        let copied_pages = usize::from(source_tail.is_some());
         let total_pages = div_ceil(request.max_position, self.config.page_tokens)?;
         let reserved_pages = total_pages
-            .checked_sub(complete_count + 1)
+            .checked_sub(complete_count + copied_pages)
             .ok_or(CacheError::Invariant("branch exceeds admitted pages"))?;
         let page_commitment = reserved_pages
-            .checked_add(1)
+            .checked_add(copied_pages)
             .ok_or(CacheError::ArithmeticOverflow)?;
         let extra = self.admission_bytes(page_commitment, request)?;
         let limit = self.admission_limit(request.allow_emergency)?;
@@ -1690,35 +1700,45 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             return Ok(AdmissionOutcome::WouldBlock);
         };
         self.prepare_sequence_slot()?;
-        self.prepare_page_slot()?;
+        if source_tail.is_some() {
+            self.prepare_page_slot()?;
+        }
         for page in &shared_pages {
             self.page_record(*page)?
                 .active_refs
                 .checked_add(1)
                 .ok_or(CacheError::ArithmeticOverflow)?;
         }
-        let copied_id = self.peek_page_id()?;
+        let copied_id = source_tail.map(|_| self.peek_page_id()).transpose()?;
         let (backend, page_slots) = (&mut self.backend, &self.pages);
-        let source_physical = page_record_from::<B>(page_slots, source_tail)?
-            .physical
-            .as_ref()
-            .ok_or(CacheError::StalePage)?;
-        let allocation = match backend.copy_partial_page(
-            source_physical,
-            position % self.config.page_tokens,
-            context,
-        ) {
-            Ok(allocation) => allocation,
-            Err(error) => {
-                self.metrics.backend_failures.inc();
-                return Err(CacheError::Backend(error));
-            }
+        let copied = if let Some(source_tail) = source_tail {
+            let source_physical = page_record_from::<B>(page_slots, source_tail)?
+                .physical
+                .as_ref()
+                .ok_or(CacheError::StalePage)?;
+            let allocation = match backend.copy_partial_page(
+                source_physical,
+                position % self.config.page_tokens,
+                context,
+            ) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    self.metrics.backend_failures.inc();
+                    return Err(CacheError::Backend(error));
+                }
+            };
+            Some((allocation.page, allocation.recycled))
+        } else {
+            None
         };
-        let copied = allocation.page;
         let mut table = physical_refs_from::<B>(page_slots, &shared_pages)?;
-        table.push(&copied);
+        if let Some((copied, _)) = copied.as_ref() {
+            table.push(copied);
+        }
         if let Err(error) = backend.update_page_table(&table, position, context) {
-            backend.rollback_page(copied, context);
+            if let Some((copied, _)) = copied {
+                backend.rollback_page(copied, context);
+            }
             self.metrics.backend_failures.inc();
             return Err(CacheError::Backend(error));
         }
@@ -1726,16 +1746,21 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
         for page in &shared_pages {
             self.increment_active_ref(*page)?;
         }
-        let copied_id_actual = self.insert_page(PageRecord {
-            physical: Some(copied),
-            active_refs: 1,
-            prefix_refs: 0,
-            valid_tokens: position % self.config.page_tokens,
-            sealed: false,
-        })?;
-        debug_assert_eq!(copied_id, copied_id_actual);
         let mut pages = shared_pages;
-        pages.push(copied_id_actual);
+        let recycled = if let Some((copied, recycled)) = copied {
+            let copied_id_actual = self.insert_page(PageRecord {
+                physical: Some(copied),
+                active_refs: 1,
+                prefix_refs: 0,
+                valid_tokens: position % self.config.page_tokens,
+                sealed: false,
+            })?;
+            debug_assert_eq!(copied_id, Some(copied_id_actual));
+            pages.push(copied_id_actual);
+            Some(recycled)
+        } else {
+            None
+        };
         let id = self.insert_sequence(SequenceRecord {
             pages,
             position,
@@ -1745,12 +1770,14 @@ impl<B: PageBackend, S: RetainedSnapshot> SequenceCache<B, S> {
             page_table_bytes: request.page_table_bytes,
             pending: None,
         })?;
-        if allocation.recycled {
-            self.metrics.pages_recycled.inc();
-        } else {
-            self.metrics.pages_allocated.inc();
+        if let Some(recycled) = recycled {
+            if recycled {
+                self.metrics.pages_recycled.inc();
+            } else {
+                self.metrics.pages_allocated.inc();
+            }
+            self.metrics.pages_copied_on_write.inc();
         }
-        self.metrics.pages_copied_on_write.inc();
         self.metrics.admission_successes.inc();
         self.refresh_stats()?;
         Ok(AdmissionOutcome::Admitted(id))

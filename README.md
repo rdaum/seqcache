@@ -63,7 +63,7 @@ The crate owns the logical state machine:
 - optional partial commit for speculative execution;
 - page validity and sealed-page transitions;
 - page-aligned prefix retention and longest-prefix lookup;
-- shared-page reference counts and unaligned-tail copy-on-write;
+- shared-page reference counts and live-sequence copy-on-write;
 - least-recently-used prefix eviction;
 - immediate and deferred page retirement accounting;
 - structural metrics and invariant validation.
@@ -249,11 +249,9 @@ computing its final token for decode.
 
 ### Copy-on-write branches
 
-`SequenceCache::branch` creates a divergent continuation from a live sequence whose position is not
-page-aligned. Complete pages remain shared. The backend copies only the valid rows of the final
-partial page into a new private tail.
-
-Aligned sequences should normally be represented by retained prefixes rather than `branch`.
+`SequenceCache::branch` creates a divergent continuation from a nonempty live sequence. Complete
+pages remain shared. A branch at a page boundary needs no page copy. At an unaligned position, the
+backend copies only the valid rows of the final partial page into a new private tail.
 
 ## Multi-page and batch append transactions
 
@@ -549,7 +547,7 @@ Before treating a backend as production-ready, verify:
 - exact and partial commit across page boundaries;
 - restoration of overwritten private-tail contents;
 - synchronization before shortening a table or recycling storage;
-- prefix restore and unaligned-tail copy-on-write;
+- prefix restore and aligned or unaligned live-sequence branching;
 - immediate and deferred retirement accounting;
 - stale reservation rejection.
 
